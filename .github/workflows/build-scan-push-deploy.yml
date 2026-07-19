@@ -1,0 +1,69 @@
+name: Build, Scan, Push, Deploy
+
+on:
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION: ap-south-1
+  SERVICE_NAME: api
+  ECR_REPOSITORY: tshirt-shop-api
+
+jobs:
+  build-scan-push-deploy:
+    runs-on: ubuntu-latest
+    steps:
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: ecr-login
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Set image tag from commit SHA
+        run: echo "IMAGE_TAG=${GITHUB_SHA::7}" >> $GITHUB_ENV
+
+      - name: Build Docker image
+        run: |
+          docker build -t ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }} .
+
+      # Trivy scans the image BEFORE it's pushed - a vulnerable image never
+      # reaches the registry at all if this fails, not just a warning after the fact
+      - name: Trivy vulnerability scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: '${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}'
+          format: 'table'
+          severity: 'CRITICAL,HIGH'
+          exit-code: '1'   # fails the job if any CRITICAL/HIGH vulnerability is found
+
+      - name: Push image to ECR
+        run: |
+          docker push ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}
+
+      # GitOps handoff: update the manifests repo, ArgoCD does the actual deploy.
+      # This job never touches the Kubernetes cluster or holds cluster credentials.
+      - name: Update GitOps manifest
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.MANIFESTS_DEPLOY_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan github.com >> ~/.ssh/known_hosts
+
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key" git clone git@github.com:vivekbutola/tshirt-shop-k8s-manifests.git manifests-repo
+          cd manifests-repo
+          sed -i "s|image: .*tshirt-shop-api:.*|image: ${{ steps.ecr-login.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.IMAGE_TAG }}|" api-deployment.yaml
+
+          git config user.email "ci@vivekbutola.in"
+          git config user.name "GitHub Actions CI"
+          git add api-deployment.yaml
+          git commit -m "Deploy api:${{ env.IMAGE_TAG }}" || echo "No changes to commit"
+          GIT_SSH_COMMAND="ssh -i ~/.ssh/deploy_key" git push origin main
